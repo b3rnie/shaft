@@ -4,26 +4,5 @@
  , {vsn, "0.1"}
  , {registered, []}
  , {applications, [kernel, stdlib]}
- , {env, [ {brokers, [ { network
-                       , [ {username,     <<"guest">>}
-                         , {password,     <<"guest">>}
-                         , {virtual_host, <<"/">>}
-                         , {host,         "localhost"}
-                         , {port,         5672}
-                         ]}
-                     , { network
-                       , [ {username,     <<"foo">>}
-                         , {password,     <<"foo">>}
-                         , {virtual_host, <<"/">>}
-                         , {host,         "localhost"}
-                         , {port,         5672}
-                         ]}
-                     , { direct
-                       , [ { username,     <<"foo">>}
-                         , { virtual_host, <<"/">>}
-                         , { node,         'rabbit@isaba'}
-                         ]}
-                     ]
-           }
-         ]}
+ , {env, []}
 ]}.
