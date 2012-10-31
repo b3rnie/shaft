@@ -55,12 +55,11 @@ unsubscribe(Ref, Queue, Options) ->
 
 %% @spec publish(Ref, Exchange, RoutingKey, Payload) -> ok
 %% @doc Publish a message
-publish(Ref, Exchange, RoutingKey, Payload) ->
-  publish(Exchange, RoutingKey, Payload, []).
+publish(Ref, Exchange, RoutingKey, Load) ->
+  publish(Ref, Exchange, RoutingKey, Load, []).
 
-publish(Ref, Exchange, RoutingKey, Payload, Options) ->
-  shaft_server:cmd(
-    Ref, publish, [Exchange, RoutingKey, Payload, Options]).
+publish(Ref, Exchange, RoutingKey, Load, Options) ->
+  shaft_server:cmd(Ref, publish, [Exchange, RoutingKey, Load, Options]).
 
 %% @spec exchange_declare(Ref, Exchange) -> ok
 %% @doc declare a new exchange
@@ -89,7 +88,7 @@ queue_declare(Ref, Queue, Options) ->
 %% @spec queue_delete(Ref, Queue) -> ok
 %% @doc delete a queue
 queue_delete(Ref, Queue) ->
-  queue_delete(Queue, []).
+  queue_delete(Ref, Queue, []).
 
 queue_delete(Ref, Queue, Options) ->
   shaft_server:cmd(Ref, queue_delete, [Queue, Options]).
@@ -114,29 +113,38 @@ unbind(Ref, Queue, Exchange, RoutingKey) ->
 
 basic_test() ->
   {ok, Pid} = get_shaft(),
-  ok        = shaft:exchange_declare(Pid, ?x),
-  {ok, ?q}  = shaft:queue_declare(?q),
-  ok        = shaft:bind(?q, ?x, ?r),
+  ok        = shaft:exchange_declare(Pid, ?x, [{type, "topic"}]),
+  {ok, ?q}  = shaft:queue_declare(Pid, ?q),
+  ok        = shaft:bind(Pid, ?q, ?x, ?r),
   Daddy     = self(),
-  ok = shaft:subscribe(Pid, fun(Term) -> {Daddy, Term} end, ?q),
-  Expected = lists:map(fun(_) ->
+  ok = shaft:subscribe(Pid, fun(Term) -> Daddy ! {Daddy, Term} end, ?q),
+  Expected = lists:map(fun(N) ->
+                           Options =
+                             case N rem 2 of
+                               0 -> [{async, false}];
+                               1 -> []
+                             end,
                            Term = random:uniform(),
-                           ok = shaft:publish(Pid, ?x, ?r, Term),
+                           ok = shaft:publish(Pid, ?x, ?r, Term,
+                                              Options),
                            Term
-                       end, lists:seq(1, 100)),
+                       end, lists:seq(1, 50)),
   lists:foreach(fun(Term) ->
                     receive {Daddy, Term} -> ok end
                 end, Expected),
+  timer:sleep(100),
+  ok = shaft:unsubscribe(Pid, ?q),
   ok = shaft:unbind(Pid, ?q, ?x, ?r),
-  ok = shaft:queue_delete(?q),
-  ok = shaft:exchange_delete(?x),
+  ok = shaft:queue_delete(Pid, ?q),
+  ok = shaft:exchange_delete(Pid, ?x),
+  shaft:stop(Pid),
   ok.
 
 get_shaft() ->
   shaft:start_link([{username, "guest"},
                     {password, "guest"},
                     {virtual_host, "/"},
-                    {hosts, {"localhost", 5672}}]).
+                    {hosts, [{"localhost", 5672}]}]).
 
 -else.
 -endif.

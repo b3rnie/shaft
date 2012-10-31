@@ -32,10 +32,11 @@
 %%%_* Code =============================================================
 %%%_ * Types -----------------------------------------------------------
 -record(s, { connection_pid
+           , connection_mref
            , channel_pid
+           , channel_mref
            , subs            = dict:new()
            , pubs            = []
-           , seen_pubno      = 0
            , next_pubno      = 1
            }).
 
@@ -51,27 +52,29 @@ cmd(Ref, Cmd, Args) ->
 
 %%%_ * gen_server callbacks --------------------------------------------
 init(Args) ->
-  case try_connect(assoc(hosts,    Args, [{"localhost", 5672}]),
-                   assoc(username, Args, "guest"),
-                   assoc(password, Args, "guest"),
-                   assoc(vhost,    Args, "virtual_host")) of
-    {ok, Pid} ->
-      erlang:link(Pid),
-      {ok, ChannelPid} = amqp_connection:open_channel(Pid),
-      erlang:link(ChannelPid),
+  case try_connect(assoc(hosts,        Args, [{"localhost", 5672}]),
+                   assoc(username,     Args, "guest"),
+                   assoc(password,     Args, "guest"),
+                   assoc(virtual_host, Args, "/")) of
+    {ok, ConnectionPid} ->
+      {ok, ChannelPid} = amqp_connection:open_channel(ConnectionPid),
       #'confirm.select_ok'{} =
         amqp_channel:call(ChannelPid, #'confirm.select'{}),
+      ok = amqp_channel:register_confirm_handler(ChannelPid, self()),
       Qos = #'basic.qos'{prefetch_count = 1},
       #'basic.qos_ok'{} = amqp_channel:call(ChannelPid, Qos),
-      ok = amqp_channel:register_confirm_handler(ChannelPid, self()),
-      {ok, #s{connection_pid=Pid, channel_pid=ChannelPid}};
+      {ok, #s{ connection_pid  = ConnectionPid
+             , channel_pid     = ChannelPid
+             , connection_mref = erlang:monitor(process, ConnectionPid)
+             , channel_mref    = erlang:monitor(process, ChannelPid)
+             }};
     {error, Rsn} ->
       {stop, Rsn}
   end.
 
 terminate(_Rsn, S) ->
   ok = amqp_channel:close(S#s.channel_pid),
-  amqp_connection:close(S#s.connection_pid),
+  ok = amqp_connection:close(S#s.connection_pid),
   ok.
 
 handle_call({subscribe, [Fun, Queue, Options]}, From, S) ->
@@ -84,7 +87,7 @@ handle_call({subscribe, [Fun, Queue, Options]}, From, S) ->
       Consume = #'basic.consume'{
          queue        = QueueBin
        , consumer_tag = QueueBin
-       , no_ack       = assoc(ack,       Options, true)
+       , no_ack       = false
        , exclusive    = assoc(exclusive, Options, false)
        },
       #'basic.consume_ok'{consumer_tag = QueueBin} =
@@ -104,7 +107,7 @@ handle_call({unsubscribe, [Queue, _Options]}, From, S) ->
       {reply, {error, not_subscribed}, S}
   end;
 
-handle_call({publish, [Exchange, RoutingKey, Payload, Options]}, From, S) ->
+handle_call({publish, [Exchange, RoutingKey, Load, Options]}, From, S) ->
   Publish = #'basic.publish'{
      exchange    = erlang:list_to_binary(Exchange)
    , routing_key = erlang:list_to_binary(RoutingKey)
@@ -120,7 +123,7 @@ handle_call({publish, [Exchange, RoutingKey, Payload, Options]}, From, S) ->
    , message_id     = assoc(message_id,     Options, <<0>>)
    , reply_to       = assoc(reply_to,       Options, undefined)
    },
-  Msg = #amqp_msg{ payload = erlang:term_to_binary(Payload)
+  Msg = #amqp_msg{ payload = erlang:term_to_binary(Load)
                  , props   = Props
                  },
   ok = amqp_channel:cast(S#s.channel_pid, Publish, Msg),
@@ -174,7 +177,7 @@ handle_call({queue_declare, [Queue0, Options]}, _From, S) ->
 
 handle_call({queue_delete, [Queue, Options]}, _From, S) ->
   Delete = #'queue.delete'{
-     queue = Queue
+     queue     = erlang:list_to_binary(Queue)
    , ticket    = assoc(ticket,    Options, 0)
    , if_unused = assoc(if_unused, Options, false)
    , if_empty  = assoc(if_empty,  Options, false)
@@ -196,14 +199,16 @@ handle_call({unbind, [Queue, Exchange, RoutingKey]}, _From, S) ->
                            , exchange    = erlang:list_to_binary(Exchange)
                            , routing_key = erlang:list_to_binary(RoutingKey)},
   #'queue.unbind_ok'{} = amqp_channel:call(S#s.channel_pid, Binding),
-  {reply, ok, S}.
+  {reply, ok, S};
+
+handle_call(stop, _From, S) ->
+  {stop, normal, ok, S}.
 
 handle_cast(_, S) ->
   {stop, bad_cast, S}.
 
 %% subscribe response
 handle_info(#'basic.consume_ok'{consumer_tag = Queue}, S) ->
-  ?info("basic.consume_ok: ~p", [Queue]),
   QueueStr = erlang:binary_to_list(Queue),
   {setup, {Fun, From}} = dict:fetch(QueueStr, S#s.subs),
   gen_server:reply(From, ok),
@@ -211,7 +216,6 @@ handle_info(#'basic.consume_ok'{consumer_tag = Queue}, S) ->
 
 %% unsubscribe
 handle_info(#'basic.cancel_ok'{consumer_tag = Queue}, S) ->
-  ?info("basic.cancel_ok: ~p", [Queue]),
   QueueStr = erlang:binary_to_list(Queue),
   {close, From} = dict:fetch(QueueStr, S#s.subs),
   gen_server:reply(From, ok),
@@ -221,23 +225,23 @@ handle_info({#'basic.deliver'{ consumer_tag = ConsumerTag
                              , delivery_tag = DeliveryTag
                              , exchange     = Exchange
                              , routing_key  = RoutingKey},
-             #amqp_msg{ payload = Payload
+             #amqp_msg{ payload = Load
                       , props   =
                           #'P_basic'{ reply_to       = To
                                     , correlation_id = Id
                                     , message_id     = MsgId}
                       }}, S) ->
   {open, Fun} = dict:fetch(erlang:binary_to_list(ConsumerTag), S#s.subs),
-  Fun(erlang:binary_to_term(Payload)),
+  Fun(erlang:binary_to_term(Load)),
   Ack = #'basic.ack'{delivery_tag = DeliveryTag},
-  amqp_channel:cast(S#s.channel_pid, Ack),
+  ok = amqp_channel:cast(S#s.channel_pid, Ack),
   {noreply, S};
 
 %% unroutable
 handle_info({#'basic.return'{ reply_text = <<"unroutable">>
-                            , exchange   = Exchange}, Payload}, S) ->
+                            , exchange   = Exchange}, Load}, S) ->
   %% slightly drastic for now.
-  {stop, {unroutable, Exchange, Payload}, S};
+  {stop, {unroutable, Exchange, Load}, S};
 
 handle_info(#'basic.ack'{ delivery_tag = Tag
                         , multiple     = Multiple
@@ -250,6 +254,14 @@ handle_info(#'basic.nack'{ delivery_tag = Tag
                          }, S) ->
   Pubs = respond_pubs({error, nack}, Tag, Multiple, S#s.pubs),
   {noreply, S#s{pubs=Pubs}};
+
+handle_info({'DOWN', Ref, process, Pid, Rsn},
+            #s{connection_pid=Pid, connection_mref=Ref} = S) ->
+  {stop, {connection_died, Rsn}, S};
+
+handle_info({'DOWN', Ref, process, Pid, Rsn},
+            #s{channel_pid=Pid, channel_mref=Ref} = S) ->
+  {stop, {channel_died, Rsn}, S};
 
 handle_info(Msg, S) ->
   ?warning("~p", [Msg]),
@@ -265,30 +277,35 @@ try_connect([{Host,Port}|Hosts], Username, Password, VHost) ->
              username     = erlang:list_to_binary(Username)
            , password     = erlang:list_to_binary(Password)
            , virtual_host = erlang:list_to_binary(VHost)
-           , host         = erlang:list_to_binary(Host)
+           , host         = Host
            , port         = Port
            , heartbeat    = 0
            }) of
     {ok, Pid} ->
       {ok, Pid};
     {error, Rsn} ->
+      ?warning("~p", [Rsn]),
       try_connect(Hosts, Username, Password, VHost)
   end;
 try_connect([], _Username, _Password, _VHost) ->
   {error, unable_to_connect}.
 
-respond_pubs(Ret, Tag, Multiple, Pubs) ->
+respond_pubs(Ret, Tag, Multiple, Pubs0) ->
   case Multiple of
     false ->
-      {value, {Tag, From}, Pubs} = lists:keytake(Tag, 1, Pubs),
-      gen_server:reply(From, Ret),
-      Pubs;
+      case lists:keytake(Tag, 1, Pubs0) of
+        {value, {Tag, From}, Pubs} ->
+          gen_server:reply(From, Ret),
+          Pubs;
+        false ->
+          Pubs0
+      end;
     true ->
       lists:filter(fun({ Id, _From}) when Id > Tag -> true;
                       ({_Id,  From}) ->
                        gen_server:reply(From, Ret),
                        false
-                   end, Pubs)
+                   end, Pubs0)
   end.
 
 assoc(K, L, D) ->
